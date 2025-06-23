@@ -5,6 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pickle
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from fastapi import HTTPException
 
 # Hyperparameters
 block_size = 64
@@ -95,20 +100,6 @@ class BigramLanguageModel(nn.Module):
         self.layer_norm_final = nn.LayerNorm(n_embd)
         self.language_model_head = nn.Linear(n_embd, vocab_size)
 
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok_emb + pos_emb
-        x = self.blocks(x)
-        logits = self.language_model_head(x)
-        loss = None
-        if targets is not None:
-            B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets)
-        return logits, loss
 
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
@@ -128,7 +119,7 @@ def load_model():
     global model, vocab, decode
     with open("saved_vocab.pkl", "rb") as f:
         vocab = pickle.load(f)
-    model = torch.load("model.pth", map_location=device)
+    model = torch.load("model.pth", map_location=device,weights_only=False)
     model.eval()
 
     def decode_fn(ids):
@@ -170,6 +161,37 @@ async def generate_text(context: str = Form(...)):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+DATABASE_URL = "mysql+mysqlconnector://username:password@localhost/dbname"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+
+Base = declarative_base()
+
+class UserModel(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, index=True)
+    password = Column(String(100))
+class User(BaseModel):
+    username: str
+    password: str
+@app.post("/api/auth/register")
+async def register_user(user: User):
+    db = SessionLocal()
+    existing_user = db.query(UserModel).filter(UserModel.username == user.username).first()
+    if existing_user:
+        db.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    new_user = UserModel(username=user.username, password=user.password)  # Hash password in prod
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    db.close()
+    return {"status": True, "user": {"username": new_user.username}}
 
 if __name__ == "__main__":
     import os
