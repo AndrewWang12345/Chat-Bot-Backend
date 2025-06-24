@@ -5,11 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pickle
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+import bcrypt
+import sqlalchemy
+import databases
 from fastapi import HTTPException
+from starlette.status import HTTP_401_UNAUTHORIZED
+from pydantic import BaseModel
+from sqlalchemy import Table, Column, Integer, String, Text
 
 # Hyperparameters
 block_size = 64
@@ -162,36 +164,113 @@ async def generate_text(context: str = Form(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+DATABASE_URL = "postgresql://postgres.hneswphqvkiovndybvyp:[password]@aws-0-ca-central-1.pooler.supabase.com:5432/postgres"
 
-DATABASE_URL = "mysql+mysqlconnector://username:password@localhost/dbname"
+database = databases.Database(DATABASE_URL)
+metadata = sqlalchemy.MetaData()
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+users = sqlalchemy.Table(
+    "users",
+    metadata,
+    sqlalchemy.Column("username", sqlalchemy.String, primary_key=True),
+    sqlalchemy.Column("password", sqlalchemy.String),
+)
 
-Base = declarative_base()
+engine = sqlalchemy.create_engine(
+    DATABASE_URL.replace("+asyncpg", ""), echo=True
+)
+metadata.create_all(engine)
 
-class UserModel(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, index=True)
-    password = Column(String(100))
 class User(BaseModel):
     username: str
     password: str
+
+@app.on_event("startup")
+async def startup():
+    await database.connect()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
+
 @app.post("/api/auth/register")
 async def register_user(user: User):
-    db = SessionLocal()
-    existing_user = db.query(UserModel).filter(UserModel.username == user.username).first()
-    if existing_user:
-        db.close()
-        raise HTTPException(status_code=400, detail="Username already exists")
+    hashed_pw = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt()).decode()
+    query = users.insert().values(username=user.username, password=hashed_pw)
+    try:
+        await database.execute(query)
+        return {"status": True, "user": {"username": user.username}}
+    except Exception as e:
+        return {"status": False, "error": str(e)}
+@app.post("/api/auth/login")
+async def login_user(user: User):
+    #print(User.username,user.password)
+    query = users.select().where(users.c.username == user.username)
+    db_user = await database.fetch_one(query)
 
-    new_user = UserModel(username=user.username, password=user.password)  # Hash password in prod
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    db.close()
-    return {"status": True, "user": {"username": new_user.username}}
+    if db_user is None:
+        raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="User not found")
+
+    if not bcrypt.checkpw(user.password.encode(), db_user["password"].encode()):
+        raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Invalid password")
+
+    return {"status": True, "user": {"username": db_user["username"]}}
+
+class UserOut(BaseModel):
+    username: str
+
+@app.get("/api/auth/allUsers/{user_id}", response_model=list[UserOut])
+async def get_all_users(user_id: str):
+    try:
+        print(user_id)
+        query = users.select().where(users.c.username != user_id)
+        print(user_id)
+        result = await database.fetch_all(query)
+        print(result)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+chat_history = Table(
+    "chat_history",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String, nullable=False),
+    Column("question", Text, nullable=False),
+    Column("answer", Text, nullable=False),
+)
+
+class ChatEntry(BaseModel):
+    username: str
+    question: str
+    answer: str
+
+@app.post("/api/chat/save")
+async def save_chat_entry(entry: ChatEntry):
+    query = chat_history.insert().values(
+        username=entry.username,
+        question=entry.question,
+        answer=entry.answer
+    )
+    await database.execute(query)
+    return {"status": "ok"}
+
+class ChatMessage(BaseModel):
+    sender: str  # 'user' or 'ai'
+    message: str
+
+@app.get("/api/chat/history/{username}", response_model=list[ChatMessage])
+async def get_chat_history(username: str):
+    query = chat_history.select().where(chat_history.c.username == username).order_by(chat_history.c.id)
+    rows = await database.fetch_all(query)
+    result = []
+    for row in rows:
+        # map your db fields to 'sender' and 'message'
+        result.append({"sender": "user", "message": row["question"]})
+        result.append({"sender": "ai", "message": row["answer"]})
+    return result
 
 if __name__ == "__main__":
     import os
