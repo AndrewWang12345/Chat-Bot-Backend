@@ -102,73 +102,88 @@ class BigramLanguageModel(nn.Module):
         self.layer_norm_final = nn.LayerNorm(n_embd)
         self.language_model_head = nn.Linear(n_embd, vocab_size)
 
-
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        logits = self.language_model_head(x)
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B * T, C)
+            targets = targets.view(B * T)
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
     def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond)  # adjust per forward above
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
-            if idx_next.item() == 46:
+            if idx_next.item() == 46:  # stop token
                 break
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
+
 # === Load model and vocab at startup ===
+import torch.serialization  # At the top, if not already imported
+
 @app.on_event("startup")
 def load_model():
-    global model, vocab, decode
-    with open("saved_vocab.pkl", "rb") as f:
-        vocab = pickle.load(f)
-    model = torch.load("model.pth", map_location=device,weights_only=False)
+    global model, vocab, decode, vocab_dict
+
+    with open("merges.pkl", "rb") as f:
+        merges = pickle.load(f)
+    vocab = list(range(256)) + list(merges.keys())  # just for reference
+    vocab_dict = merges
+
+    # ✅ Unpickle the full model safely
+    torch.serialization.add_safe_globals({'BigramLanguageModel': BigramLanguageModel})
+    model = torch.load("model.pth", map_location=device, weights_only=False)
+    model.to(device)
     model.eval()
 
     def decode_fn(ids):
-        tokens = b"".join(vocab[idx] for idx in ids)
+        byte_map = {i: bytes([i]) for i in range(256)}
+
+        def decode_token(token_id):
+            if token_id in byte_map:
+                return byte_map[token_id]
+            # Recursively decode
+            for (a, b), idx in merges.items():
+                if idx == token_id:
+                    decoded = decode_token(a) + decode_token(b)
+                    byte_map[token_id] = decoded
+                    return decoded
+            # fallback for unknown token
+            return b'?'
+
+        # Build all merged tokens recursively (optional but ensures cache)
+        for (a, b), idx in merges.items():
+            if idx not in byte_map:
+                decode_token(idx)
+
+        tokens_bytes = []
+        for i in ids:
+            if i in byte_map:
+                tokens_bytes.append(byte_map[i])
+            else:
+                tokens_bytes.append(b'?')
+        tokens = b"".join(tokens_bytes)
         return tokens.decode("utf-8", errors="replace")
 
     decode = decode_fn
 
 
-# === Endpoint ===
-@app.post("/generate")
-async def generate_text(context: str = Form(...)):
-    try:
-        # Tokenize input (naively using vocab)
-        input_ids = []
-        for c in context.encode("utf-8"):
-            for i, token in enumerate(vocab):
-                if token == bytes([c]):
-                    input_ids.append(i)
-                    break
-        if not input_ids:
-            return JSONResponse(status_code=400, content={"error": "Invalid input context"})
-
-        idx = torch.tensor([input_ids], dtype=torch.long, device=device)
-        output_ids = model.generate(idx, max_new_tokens=500)[0].tolist()
-        raw_text = decode(output_ids)
-
-        # Optional filtering
-        filtered = ""
-        for char in reversed(raw_text):
-            if char != '\n' and (
-                ('A' <= char <= 'Z') or
-                ('a' <= char <= 'z') or
-                ('1' <= char <= '9')
-            ):
-                filtered = char + filtered
-
-        return {"generated_text": filtered}
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-DATABASE_URL = "postgresql://postgres.hneswphqvkiovndybvyp:[password]@aws-0-ca-central-1.pooler.supabase.com:5432/postgres"
+DATABASE_URL = "postgresql://postgres.hneswphqvkiovndybvyp:andrewwangisgrea@aws-0-ca-central-1.pooler.supabase.com:5432/postgres"
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
-
 users = sqlalchemy.Table(
     "users",
     metadata,
@@ -179,7 +194,105 @@ users = sqlalchemy.Table(
 engine = sqlalchemy.create_engine(
     DATABASE_URL.replace("+asyncpg", ""), echo=True
 )
+chat_history = Table(
+    "chat_history",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String, nullable=False),
+    Column("question", Text, nullable=False),
+    Column("answer", Text, nullable=False),
+)
 metadata.create_all(engine)
+class GenerateRequest(BaseModel):
+    username: str
+    question: str
+def bpe_tokenize(byte_sequence, merges):
+    # Filter out unknown bytes: keep only bytes in vocab (0-255) or in merges keys
+    known_bytes = set(range(256))
+    known_pairs = set(merges.keys())
+
+    # Start with raw bytes as ints, but only keep known bytes
+    ids = [b for b in byte_sequence if b in known_bytes]
+
+    # Now apply merges on ids as usual
+    while True:
+        stats = {}
+        for pair in zip(ids, ids[1:]):
+            stats[pair] = stats.get(pair, 0) + 1
+        if not stats:
+            break
+        most_common = max(stats, key=stats.get)
+        if most_common not in merges:
+            break
+        idx = merges[most_common]
+        new_ids = []
+        i = 0
+        while i < len(ids):
+            if i < len(ids) - 1 and (ids[i], ids[i + 1]) == most_common:
+                new_ids.append(idx)
+                i += 2
+            else:
+                new_ids.append(ids[i])
+                i += 1
+        ids = new_ids
+    return ids
+
+@app.post("/generate")
+async def generate_text(data: GenerateRequest):
+    username = data.username
+    question = data.question
+    print(f"Received context: {question}")
+    print(f"From user: {username}")
+    try:
+        # Step 1: Load previous 4 chat entries (most recent first)
+        query = (
+            chat_history
+            .select()
+            .where(chat_history.c.username == username)
+            .order_by(chat_history.c.id.desc())
+            .limit(4)
+        )
+        previous_entries = await database.fetch_all(query)
+
+        # Step 2: Reverse to get chronological order and build context string
+        previous_entries = list(reversed(previous_entries))
+        previous_context = ""
+        for row in previous_entries:
+            previous_context += row['question'] + " " + row['answer']
+
+        # Step 3: Append current question
+        full_context = previous_context + " " + question + " "
+        print(full_context)
+        # Step 4: Tokenize input
+        input_bytes = full_context.encode("utf-8")
+        input_ids = bpe_tokenize(input_bytes, vocab_dict)
+
+        idx = torch.tensor([input_ids], dtype=torch.long, device=device)
+        output_ids = model.generate(idx, max_new_tokens=50)[0].tolist()
+        raw_text = decode(output_ids)
+        print(raw_text)
+        # Step 5: Filter output (optional cleanup)
+        filtered = ""
+        for char in reversed(raw_text):
+            if char != '\n':
+                filtered = char + filtered
+        print(filtered)
+        # Step 6: Save this interaction
+        insert_query = chat_history.insert().values(
+            username=username,
+            question=question,
+            answer=filtered[len(full_context):]
+        )
+        await database.execute(insert_query)
+
+        return {"generated_text": filtered[len(full_context):]}
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+
+
 
 class User(BaseModel):
     username: str
@@ -233,14 +346,7 @@ async def get_all_users(user_id: str):
 
 
 
-chat_history = Table(
-    "chat_history",
-    metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("username", String, nullable=False),
-    Column("question", Text, nullable=False),
-    Column("answer", Text, nullable=False),
-)
+
 
 class ChatEntry(BaseModel):
     username: str
