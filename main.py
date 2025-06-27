@@ -25,6 +25,7 @@ app = FastAPI()
 
 origins = [
     "http://localhost:3000",  # dev frontend
+    "https://chat-bot-frontend-three.vercel.app",
 ]
 
 app.add_middleware(
