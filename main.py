@@ -23,9 +23,13 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = FastAPI()
 
+origins = [
+    "http://localhost:3000",  # dev frontend
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,  # or ["*"] for all (not recommended for prod)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -382,5 +386,5 @@ if __name__ == "__main__":
     import os
     import uvicorn
 
-    port = int(os.getenv("WEBSITES_PORT", 8000))
+    port = int(os.getenv("PORT", 8181))
     uvicorn.run(app, host="0.0.0.0", port=port)

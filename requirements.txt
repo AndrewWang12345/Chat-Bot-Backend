@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+torch
+bcrypt
+sqlalchemy
+databases[postgresql]
+python-multipart
+psycopg2-binary
